@@ -23,9 +23,9 @@
  **********************************************************/
 team_t team = {
     /* Your full name */
-    "",
+    "Yongun Seong",
     /* Your student ID */
-    ""
+    "2017-19937"
 };
 
 /* DON'T MODIFY THIS VALUE AND LEAVE IT AS IT WAS */
@@ -121,3 +121,5 @@ void mm_exit(void)
 
 
 }
+
+// vim: ts=4 sts=4 sw=4 et
