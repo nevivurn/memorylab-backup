@@ -148,7 +148,7 @@ void *mm_malloc(size_t size)
     heap++;
 
     // short-circuit large blocks
-    if (heap[1] && reqsz > heap[1]) 
+    if (heap[1] && reqsz >= heap[1])
         return mm_malloc_new(reqsz);
 
     // scan free list
@@ -219,11 +219,17 @@ void mm_free(void *ptr)
         end += HEAD_SIZE(end)/sizeof(size_t);
     }
 
-    HEAD_SET(start, (end-start)*sizeof(size_t), 0);
-    HEAD_SET(end-1, (end-start)*sizeof(size_t), 0);
+    size_t freesz = (end-start)*sizeof(size_t);
+    HEAD_SET(start, freesz, 0);
+    HEAD_SET(end-1, freesz, 0);
 
     size_t *heap = mem_heap_lo();
-    mm_malloc_new_free(heap+1, start);
+    heap++;
+
+    mm_malloc_new_free(heap, start);
+    // update short-circuit upper bound if needed
+    if (heap[1] && heap[1] < freesz)
+        heap[1] = freesz;
 
     /* DON'T MODIFY THIS STAGE AND LEAVE IT AS IT WAS */
     if (gl_ranges)
