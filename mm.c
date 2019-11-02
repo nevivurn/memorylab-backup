@@ -74,13 +74,16 @@ static void remove_range(range_t **ranges, char *lo)
 int mm_init(range_t **ranges)
 {
     /* Initialize heap */
-    size_t *heap = mem_sbrk(2*SIZE_T_SIZE);
+    size_t *heap = mem_sbrk(3*SIZE_T_SIZE);
     if (heap == (void *) -1)
         return -1;
+    heap++;
 
-    HEAD_SET(heap+1, SIZE_T_SIZE, 1);
-    HEAD_SET(heap+2, SIZE_T_SIZE, 1);
-    HEAD_SET(heap+3, 0, 1);
+    HEAD_SET(heap, 2*SIZE_T_SIZE, 1);
+    heap[1] = NULL;
+    heap[2] = 0;
+    HEAD_SET(&heap[3], 2*SIZE_T_SIZE, 1);
+    HEAD_SET(&heap[4], 0, 1);
 
     /* DON'T MODIFY THIS STAGE AND LEAVE IT AS IT WAS */
     gl_ranges = ranges;
@@ -88,6 +91,49 @@ int mm_init(range_t **ranges)
     return 0;
 }
 
+/*
+ * Allocates a brand-new portion of the heap, obtained through a call to
+ * mem_sbrk().
+ */
+static void *mm_malloc_new(size_t reqsz) {
+    size_t *new_area = mem_sbrk(reqsz);
+    if (new_area == (void *)-1)
+        return NULL;
+
+    // cur block header
+    HEAD_SET(&new_area[-1], reqsz, 1);
+    // cur block footer
+    HEAD_SET(&new_area[reqsz/sizeof(size_t)-2], reqsz, 1);
+    // next block header
+    HEAD_SET(&new_area[reqsz/sizeof(size_t)-1], 0, 1);
+
+    return (void *)new_area;
+}
+
+/*
+ * Adds a new free block to the free list.
+ */
+static void mm_malloc_new_free(size_t *heap, size_t *block) {
+    if (heap[2] != NULL) {
+        size_t *first = (size_t *)heap[2];
+        first[1] = block;
+    }
+    block[1] = heap;
+    block[2] = heap[2];
+    heap[2] = block;
+}
+
+
+static void mm_malloc_rm_free(size_t *block) {
+    // prev is never null
+    size_t *prev = (size_t *)block[1];
+    prev[2] = block[2];
+
+    if (block[2] != NULL) {
+        size_t *next = (size_t *)block[2];
+        next[1] = block[1];
+    }
+}
 /*
  *  mm_malloc - Allocate a block by incrementing the brk pointer (example).
  *  Always allocate a block whose size is a multiple of the alignment.-
@@ -97,32 +143,55 @@ void *mm_malloc(size_t size)
     if (size == 0)
         return NULL;
 
-    size_t reqsz = ALIGN(size) + SIZE_T_SIZE, cursz;
+    size_t reqsz = ALIGN(size) + SIZE_T_SIZE;
     size_t *heap = mem_heap_lo();
     heap++;
 
-    while ((cursz = HEAD_SIZE(heap)) < reqsz || HEAD_ALLOC(heap)) {
-        if (cursz == 0)
+    // short-circuit large blocks
+    if (heap[1] && reqsz > heap[1]) 
+        return mm_malloc_new(reqsz);
+
+    // scan free list
+    size_t *cur_head = (size_t *)heap[2], cursz;
+    while (cur_head != NULL) {
+        if (!HEAD_ALLOC(cur_head) && (cursz = HEAD_SIZE(cur_head)) >= reqsz)
             break;
-        heap += cursz/sizeof(size_t);
+        cur_head = (size_t *)cur_head[2];
     }
 
-    if (cursz >= reqsz) {
-        // allocate into existing blocks
-        HEAD_SET(heap, cursz, 1);
-        HEAD_SET(heap + cursz/sizeof(size_t) - 1, cursz, 1);
-        return (void *)(heap+1);
-    } else {
-        // allocate new memory
-        void *new_area = mem_sbrk(reqsz);
-        if (new_area == (void *)-1)
-            return NULL;
-
-        HEAD_SET(heap, reqsz, 1);
-        HEAD_SET(heap + reqsz/sizeof(size_t) - 1, reqsz, 1);
-        HEAD_SET(heap + reqsz/sizeof(size_t), 0, 1);
-        return (void *) new_area;
+    // no appropriate block found
+    if (cur_head == NULL) {
+        // update short-circuit
+        if (!heap[1] || heap[1] > reqsz)
+            heap[1] = reqsz;
+        return mm_malloc_new(reqsz);
     }
+    // else, reuse existing block at cur_head
+
+    // reset known free size if necessary
+    if (cursz == heap[1])
+        heap[1] = 0;
+
+    // remove from free list
+    mm_malloc_rm_free(cur_head);
+
+    // splitting logic
+    if (cursz - reqsz >= 16) {
+        size_t restsz = cursz - reqsz;
+
+        HEAD_SET(&cur_head[reqsz/sizeof(size_t)], restsz, 0);
+        HEAD_SET(&cur_head[cursz/sizeof(size_t)-1], restsz, 0);
+
+        mm_malloc_new_free(heap, &cur_head[reqsz/sizeof(size_t)]);
+        cursz = reqsz;
+    }
+
+    // set cur header
+    HEAD_SET(cur_head, cursz, 1);
+    // set cur footer
+    HEAD_SET(&cur_head[cursz/sizeof(size_t)-1], cursz, 1);
+
+    return (void *)(cur_head+1);
 }
 
 /*
@@ -130,12 +199,31 @@ void *mm_malloc(size_t size)
  */
 void mm_free(void *ptr)
 {
-    size_t *heap = ptr;
-    heap--;
+    size_t *block = ((size_t *)ptr)-1;
 
-    size_t cursz = HEAD_SIZE(heap);
-    HEAD_SET(heap, cursz, 0);
-    HEAD_SET(heap + cursz/sizeof(size_t) -1, cursz, 0);
+    // error on double-free
+    if (!HEAD_ALLOC(block)) {
+        fprintf(stderr, "double-free detected\n");
+        exit(1);
+    }
+
+    size_t *start = block, *end = &block[HEAD_SIZE(block)/sizeof(size_t)];
+
+    if (!HEAD_ALLOC(&start[-1])) {
+        start -= HEAD_SIZE(&start[-1])/sizeof(size_t);
+        mm_malloc_rm_free(start);
+    }
+
+    if (!HEAD_ALLOC(end)) {
+        mm_malloc_rm_free(end);
+        end += HEAD_SIZE(end)/sizeof(size_t);
+    }
+
+    HEAD_SET(start, (end-start)*sizeof(size_t), 0);
+    HEAD_SET(end-1, (end-start)*sizeof(size_t), 0);
+
+    size_t *heap = mem_heap_lo();
+    mm_malloc_new_free(heap+1, start);
 
     /* DON'T MODIFY THIS STAGE AND LEAVE IT AS IT WAS */
     if (gl_ranges)
@@ -155,16 +243,14 @@ void *mm_realloc(void *ptr, size_t t)
  */
 void mm_exit(void)
 {
-    size_t *heap = mem_heap_lo();
+    size_t *heap = mem_heap_lo(), cursz;
     heap++;
 
-    heap += HEAD_SIZE(heap)/sizeof(size_t);
-
-    size_t cursz;
+    heap = &heap[HEAD_SIZE(heap)/sizeof(size_t)];
     while ((cursz = HEAD_SIZE(heap)) != 0) {
         if (HEAD_ALLOC(heap))
             mm_free(heap+1);
-        heap += cursz/sizeof(size_t);
+        heap = &heap[cursz/sizeof(size_t)];
     }
 }
 
