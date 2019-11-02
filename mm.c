@@ -1,12 +1,53 @@
 /*
- * mm-naive.c - The fastest, least memory-efficient malloc package.
+ * mm.c - an explicit free list allocator.
  *
- * In this naive approach, a block is allocated by simply incrementing
- * the brk pointer.  A block is pure payload. There are no headers or
- * footers.  Blocks are never coalesced or reused. Realloc isn't implemented.
+ * This is mostly a traditional explicit free list allocator, where we keep
+ * track of a linked list containing only the free blocks.
  *
- * NOTE TO STUDENTS: Replace this header comment with your own header
- * comment that gives a high level description of your solution.
+ * Eack block is as follows:
+ * struct block {
+ *     size_t header;
+ *     block *prev;
+ *     block *next;
+ *     char payload[N];
+ *     size_t footer;
+ * }
+ * where N is the size of the payload.
+ * The header and footer both contain the same data, the size of the block
+ * (including both header and footer) in bytes, and the allocated flag at its
+ * least-significant bit.
+ *
+ * The heap itself is 8-byte aligned, so the footer of the previous block will
+ * share a double-word with the header of the following word.
+ *
+ * The first block (the "dummy" block) and the last block (the "end" block) have
+ * a slightly different structure and usage.
+ *
+ * The first block is structured just like a regular block, but because its
+ * "prev" field will always be NULL (and is never accessed), it can be used for
+ * other uses, and in this case, it was used for the "short-circuit" mechanism.
+ *
+ * The last block is designed to mark the end of the heap (so if a heap scan
+ * reaches this block, it should grow the heap to fit in the new block). It only
+ * needs to have a header, of a special size 0 and marked as allocated.
+ *
+ * The malloc() function acts as usual in an explicit free list allocator,
+ * choosing first-fit block to insert and splitting a block if and only if the
+ * split size produces two blocks that are larger than the minimum size of a
+ * block (which happens to be 24 bytes, the size of teh above block struct
+ * rounded up to a multiple of 8).
+ *
+ * The "short-circuit" mechanism mentioned above works as follows: because the
+ * slowest case in an explicit free list allocator is when a full traversal of
+ * the free list is done, due to none of the blocks being large enough to fit
+ * the new incoming block. In order to prevent a full traversal, we keep track
+ * of the smallest block size that was unable to be allocated, and skip the heap
+ * traversal in its entirety when the incoming block has a block size larger
+ * than this threshold. This threshold is adjusted downwards when a small block
+ * fails to be allocated using the existing heap, and is adjusted upwards when a
+ * sufficiently large block is free()'d.
+ * This mechanism degrades to a regular explicit free list behavior when the
+ * allocations fail inside the heap in reverse size order.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,6 +111,11 @@ static void remove_range(range_t **ranges, char *lo)
 
 /*
  *  mm_init - initialize the malloc package.
+ *  it initializes the heap with a dummy prologue and epilogue. The prologue
+ *  is a block that seems to be 24 bytes long, that holds the short-circuit
+ *  threshold in the "prev" field ([1]) and the beginning of the free list in
+ *  the "next" field ([2]). The prologue holds a dummy "allocated" block of zie
+ *  0, to mark the end of the heap.
  */
 int mm_init(range_t **ranges)
 {
@@ -80,8 +126,8 @@ int mm_init(range_t **ranges)
     heap++;
 
     HEAD_SET(heap, 2*SIZE_T_SIZE, 1);
-    heap[1] = NULL;
-    heap[2] = 0;
+    heap[1] = 0;
+    heap[2] = NULL;
     HEAD_SET(&heap[3], 2*SIZE_T_SIZE, 1);
     HEAD_SET(&heap[4], 0, 1);
 
@@ -92,8 +138,10 @@ int mm_init(range_t **ranges)
 }
 
 /*
- * Allocates a brand-new portion of the heap, obtained through a call to
- * mem_sbrk().
+ * mm_malloc_new - allocate a brand-new portion of the heap.
+ * Allocates a new portion of the heap, obtained through a call to mem_sbrk().
+ * It then updates the former epilogue to be the new header, and adds a footer
+ * as well as the new epilogue.
  */
 static void *mm_malloc_new(size_t reqsz) {
     size_t *new_area = mem_sbrk(reqsz);
@@ -111,7 +159,11 @@ static void *mm_malloc_new(size_t reqsz) {
 }
 
 /*
- * Adds a new free block to the free list.
+ * mm_malloc_new_free - add a new free block to the free list.
+ * This inserts the new block at the beginning of the free list, by setting its
+ * "prev" field to the first block in the heap and the "next" node to the former
+ * first block. It also updates the former first block's "next" field if it
+ * if it exists.
  */
 static void mm_malloc_new_free(size_t *heap, size_t *block) {
     if (heap[2] != NULL) {
@@ -123,7 +175,11 @@ static void mm_malloc_new_free(size_t *heap, size_t *block) {
     heap[2] = block;
 }
 
-
+/*
+ * mm_malloc_rm_free - remove a block from the free list.
+ * Removes the block by setting the "next" field of the block before this (which
+ * is guaranteed to never be null) to its own "next", and vice versa.
+ */
 static void mm_malloc_rm_free(size_t *block) {
     // prev is never null
     size_t *prev = (size_t *)block[1];
@@ -135,8 +191,13 @@ static void mm_malloc_rm_free(size_t *block) {
     }
 }
 /*
- *  mm_malloc - Allocate a block by incrementing the brk pointer (example).
- *  Always allocate a block whose size is a multiple of the alignment.-
+ * mm_malloc - allocate a block.
+ * First check the short-circuit threshold, and allocate a new block with
+ * mm_malloc_new if this block cannot be inserted in the current heap.
+ * Otherwise, traverse the free list to see if there is any block where we can
+ * insert this new block, and insert it as needed. If this block could not be
+ * inserted, adjust the threshold downwards (as appropriate) and use
+ * mm_malloc_new.
  */
 void *mm_malloc(size_t size)
 {
@@ -151,7 +212,7 @@ void *mm_malloc(size_t size)
     if (heap[1] && reqsz >= heap[1])
         return mm_malloc_new(reqsz);
 
-    // scan free list
+    // scan free list, first fit
     size_t *cur_head = (size_t *)heap[2], cursz;
     while (cur_head != NULL) {
         if (!HEAD_ALLOC(cur_head) && (cursz = HEAD_SIZE(cur_head)) >= reqsz)
@@ -168,15 +229,11 @@ void *mm_malloc(size_t size)
     }
     // else, reuse existing block at cur_head
 
-    // reset known free size if necessary
-    if (cursz == heap[1])
-        heap[1] = 0;
-
     // remove from free list
     mm_malloc_rm_free(cur_head);
 
-    // splitting logic
-    if (cursz - reqsz >= 16) {
+    // splitting logic, only split if the other part is large enough
+    if (cursz - reqsz >= 24) {
         size_t restsz = cursz - reqsz;
 
         HEAD_SET(&cur_head[reqsz/sizeof(size_t)], restsz, 0);
@@ -195,7 +252,10 @@ void *mm_malloc(size_t size)
 }
 
 /*
- *  mm_free - Frees a block. Does nothing (example)
+ * mm_free - free a block.
+ * First adjust the free beginning and end by coalescing with its neighboring
+ * blocks, then adjusts the free list as appropriate. We also upwardly adjust
+ * the short-circuit threshold if needed.
  */
 void mm_free(void *ptr)
 {
@@ -228,8 +288,8 @@ void mm_free(void *ptr)
 
     mm_malloc_new_free(heap, start);
     // update short-circuit upper bound if needed
-    if (heap[1] && heap[1] < freesz)
-        heap[1] = freesz;
+    if (heap[1] && heap[1] < freesz+1)
+        heap[1] = freesz+1;
 
     /* DON'T MODIFY THIS STAGE AND LEAVE IT AS IT WAS */
     if (gl_ranges)
@@ -245,7 +305,7 @@ void *mm_realloc(void *ptr, size_t t)
 }
 
 /*
- *  mm_exit - finalize the malloc package.
+ *  mm_exit - free all blocks by traversing the entire heap.
  */
 void mm_exit(void)
 {
