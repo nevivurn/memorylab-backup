@@ -61,13 +61,26 @@ static void remove_range(range_t **ranges, char *lo)
     }
 }
 
+#define HEAD_SIZE_MASK (~0x7)
+#define HEAD_ALLOC_MASK (0x1)
+#define HEAD_DATA(head) (*(size_t *)(head))
+#define HEAD_SIZE(head) (HEAD_DATA(head) & HEAD_SIZE_MASK)
+#define HEAD_ALLOC(head) (HEAD_DATA(head) & HEAD_ALLOC_MASK)
+#define HEAD_SET(head, size, alloc) (HEAD_DATA(head) = (size & HEAD_SIZE_MASK) | (alloc & HEAD_ALLOC_MASK))
+
 /*
  *  mm_init - initialize the malloc package.
  */
 int mm_init(range_t **ranges)
 {
-    /* YOUR IMPLEMENTATION */
+    /* Initialize heap */
+    size_t *heap = mem_sbrk(2*SIZE_T_SIZE);
+    if (heap == (void *) -1)
+        return -1;
 
+    HEAD_SET(heap+1, SIZE_T_SIZE, 1);
+    HEAD_SET(heap+2, SIZE_T_SIZE, 1);
+    HEAD_SET(heap+3, 0, 1);
 
     /* DON'T MODIFY THIS STAGE AND LEAVE IT AS IT WAS */
     gl_ranges = ranges;
@@ -81,13 +94,34 @@ int mm_init(range_t **ranges)
  */
 void *mm_malloc(size_t size)
 {
-    int newsize = ALIGN(size + SIZE_T_SIZE);
-    void *p = mem_sbrk(newsize);
-    if (p == (void *)-1)
+    if (size == 0)
         return NULL;
-    else {
-        *(size_t *)p = size;
-        return (void *)((char *)p + SIZE_T_SIZE);
+
+    size_t reqsz = ALIGN(size) + SIZE_T_SIZE, cursz;
+    size_t *heap = mem_heap_lo();
+    heap++;
+
+    while ((cursz = HEAD_SIZE(heap)) < reqsz || HEAD_ALLOC(heap)) {
+        if (cursz == 0)
+            break;
+        heap += cursz/sizeof(size_t);
+    }
+
+    if (cursz >= reqsz) {
+        // allocate into existing blocks
+        HEAD_SET(heap, cursz, 1);
+        HEAD_SET(heap + cursz/sizeof(size_t) - 1, cursz, 1);
+        return (void *)(heap+1);
+    } else {
+        // allocate new memory
+        void *new_area = mem_sbrk(reqsz);
+        if (new_area == (void *)-1)
+            return NULL;
+
+        HEAD_SET(heap, reqsz, 1);
+        HEAD_SET(heap + reqsz/sizeof(size_t) - 1, reqsz, 1);
+        HEAD_SET(heap + reqsz/sizeof(size_t), 0, 1);
+        return (void *) new_area;
     }
 }
 
@@ -96,8 +130,12 @@ void *mm_malloc(size_t size)
  */
 void mm_free(void *ptr)
 {
-    /* YOUR IMPLEMENTATION */
+    size_t *heap = ptr;
+    heap--;
 
+    size_t cursz = HEAD_SIZE(heap);
+    HEAD_SET(heap, cursz, 0);
+    HEAD_SET(heap + cursz/sizeof(size_t) -1, cursz, 0);
 
     /* DON'T MODIFY THIS STAGE AND LEAVE IT AS IT WAS */
     if (gl_ranges)
@@ -117,9 +155,17 @@ void *mm_realloc(void *ptr, size_t t)
  */
 void mm_exit(void)
 {
-    /* YOUR IMPLEMENTATION */
+    size_t *heap = mem_heap_lo();
+    heap++;
 
+    heap += HEAD_SIZE(heap)/sizeof(size_t);
 
+    size_t cursz;
+    while ((cursz = HEAD_SIZE(heap)) != 0) {
+        if (HEAD_ALLOC(heap))
+            mm_free(heap+1);
+        heap += cursz/sizeof(size_t);
+    }
 }
 
 // vim: ts=4 sts=4 sw=4 et
