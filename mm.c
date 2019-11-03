@@ -119,7 +119,7 @@ static void remove_range(range_t **ranges, char *lo)
  */
 int mm_init(range_t **ranges)
 {
-    /* Initialize heap */
+    // Initialize heap
     size_t *heap = mem_sbrk(3*SIZE_T_SIZE);
     if (heap == (void *) -1)
         return -1;
@@ -135,40 +135,6 @@ int mm_init(range_t **ranges)
     gl_ranges = ranges;
 
     return 0;
-}
-
-/*
- * mm_malloc_new - allocate a brand-new portion of the heap.
- * Allocates a new portion of the heap, obtained through a call to mem_sbrk().
- * It then updates the former epilogue to be the new header, and adds a footer
- * as well as the new epilogue. As special case, if the difference between
- * the payload size rounded up to the nearest power of two is small, the size is
- * rounded up to the power of two.
- */
-static void *mm_malloc_new(size_t reqsz) {
-    // if not a multiple of two, try rounding to a near power of two
-    size_t rnd = reqsz - 2*SIZE_T_SIZE - 1;
-    rnd |= rnd>>1;
-    rnd |= rnd>>2;
-    rnd |= rnd>>4;
-    rnd |= rnd>>8;
-    rnd |= rnd>>16;
-    rnd += 2*SIZE_T_SIZE + 1;
-    if (rnd-reqsz < rnd/4)
-        reqsz = rnd;
-
-    size_t *new_area = mem_sbrk(reqsz);
-    if (new_area == (void *)-1)
-        return NULL;
-
-    // cur block header
-    HEAD_SET(&new_area[-1], reqsz, 1);
-    // cur block footer
-    HEAD_SET(&new_area[reqsz/sizeof(size_t)-2], reqsz, 1);
-    // next block header
-    HEAD_SET(&new_area[reqsz/sizeof(size_t)-1], 0, 1);
-
-    return (void *)new_area;
 }
 
 /*
@@ -203,6 +169,60 @@ static void mm_malloc_rm_free(size_t *block) {
         next[1] = block[1];
     }
 }
+
+/*
+ * mm_malloc_new - allocate a brand-new portion of the heap.
+ * Allocates a new portion of the heap, obtained through a call to mem_sbrk().
+ * It then updates the former epilogue to be the new header, and adds a footer
+ * as well as the new epilogue. As special case, if the difference between
+ * the payload size rounded up to the nearest power of two is small, the size is
+ * rounded up to the power of two.
+ */
+static void *mm_malloc_new(size_t reqsz) {
+    // if not a multiple of two, try rounding to a near power of two
+    size_t rnd = reqsz - 2*SIZE_T_SIZE - 1;
+    rnd |= rnd>>1;
+    rnd |= rnd>>2;
+    rnd |= rnd>>4;
+    rnd |= rnd>>8;
+    rnd |= rnd>>16;
+    rnd += 2*SIZE_T_SIZE + 1;
+    if (rnd-reqsz < rnd/4)
+        reqsz = rnd;
+
+    size_t *heap_bot = (size_t *)((char *)mem_heap_hi()+1) - 2;
+    if (!HEAD_ALLOC(heap_bot)) {
+        // last block is free, extend it
+        size_t cursz = HEAD_SIZE(heap_bot);
+        size_t *cur_head = &heap_bot[-cursz/sizeof(size_t)+1];
+
+        mm_malloc_rm_free(cur_head);
+
+        void *mem = mem_sbrk(reqsz-cursz);
+        if (mem == (void *)-1)
+            return NULL;
+
+        HEAD_SET(cur_head, reqsz, 1);
+        HEAD_SET(&cur_head[reqsz/sizeof(size_t)-1], reqsz, 1);
+        HEAD_SET(&cur_head[reqsz/sizeof(size_t)], 0, 1);
+
+        return (void *)&cur_head[1];
+    }
+
+    size_t *new_area = mem_sbrk(reqsz);
+    if (new_area == (void *)-1)
+        return NULL;
+
+    // cur block header
+    HEAD_SET(&new_area[-1], reqsz, 1);
+    // cur block footer
+    HEAD_SET(&new_area[reqsz/sizeof(size_t)-2], reqsz, 1);
+    // next block header
+    HEAD_SET(&new_area[reqsz/sizeof(size_t)-1], 0, 1);
+
+    return (void *)new_area;
+}
+
 /*
  * mm_malloc - allocate a block.
  * First check the short-circuit threshold, and allocate a new block with
@@ -230,17 +250,13 @@ void *mm_malloc(size_t size)
     size_t *best_head = NULL, bestsz;
     while (cur_head != NULL) {
         if (!HEAD_ALLOC(cur_head) && (cursz = HEAD_SIZE(cur_head)) >= reqsz) {
-            // pseudo best-fit logic, try to reduce fragmentation by looking for
-            // a better block in case it would cause fragmentation
-            if (cursz-reqsz > reqsz/4) {
-                if (best_head == NULL || bestsz-reqsz > cursz-reqsz) {
-                    best_head = cur_head;
-                    bestsz = cursz;
-                }
-            } else {
+            if (cursz-reqsz <= reqsz/4) {
                 best_head = cur_head;
                 bestsz = cursz;
                 break;
+            } else if (best_head == NULL || cursz < bestsz) {
+                best_head = cur_head;
+                bestsz = cursz;
             }
         }
         cur_head = (size_t *)cur_head[2];
@@ -262,7 +278,7 @@ void *mm_malloc(size_t size)
     mm_malloc_rm_free(cur_head);
 
     // splitting logic, only split if the other part is large enough
-    if (cursz - reqsz >= 24) {
+    if (cursz - reqsz >= 16) {
         size_t restsz = cursz - reqsz;
 
         HEAD_SET(&cur_head[reqsz/sizeof(size_t)], restsz, 0);
@@ -277,7 +293,7 @@ void *mm_malloc(size_t size)
     // set cur footer
     HEAD_SET(&cur_head[cursz/sizeof(size_t)-1], cursz, 1);
 
-    return (void *)(cur_head+1);
+    return (void *)&cur_head[1];
 }
 
 /*
