@@ -141,9 +141,22 @@ int mm_init(range_t **ranges)
  * mm_malloc_new - allocate a brand-new portion of the heap.
  * Allocates a new portion of the heap, obtained through a call to mem_sbrk().
  * It then updates the former epilogue to be the new header, and adds a footer
- * as well as the new epilogue.
+ * as well as the new epilogue. As special case, if the difference between
+ * the payload size rounded up to the nearest power of two is small, the size is
+ * rounded up to the power of two.
  */
 static void *mm_malloc_new(size_t reqsz) {
+    // if not a multiple of two, try rounding to a near power of two
+    size_t rnd = reqsz - 2*SIZE_T_SIZE - 1;
+    rnd |= rnd>>1;
+    rnd |= rnd>>2;
+    rnd |= rnd>>4;
+    rnd |= rnd>>8;
+    rnd |= rnd>>16;
+    rnd += 2*SIZE_T_SIZE + 1;
+    if (rnd-reqsz < rnd/4)
+        reqsz = rnd;
+
     size_t *new_area = mem_sbrk(reqsz);
     if (new_area == (void *)-1)
         return NULL;
@@ -214,11 +227,27 @@ void *mm_malloc(size_t size)
 
     // scan free list, first fit
     size_t *cur_head = (size_t *)heap[2], cursz;
+    size_t *best_head = NULL, bestsz;
     while (cur_head != NULL) {
-        if (!HEAD_ALLOC(cur_head) && (cursz = HEAD_SIZE(cur_head)) >= reqsz)
-            break;
+        if (!HEAD_ALLOC(cur_head) && (cursz = HEAD_SIZE(cur_head)) >= reqsz) {
+            // pseudo best-fit logic, try to reduce fragmentation by looking for
+            // a better block in case it would cause fragmentation
+            if (cursz-reqsz > reqsz/4) {
+                if (best_head == NULL || bestsz-reqsz > cursz-reqsz) {
+                    best_head = cur_head;
+                    bestsz = cursz;
+                }
+            } else {
+                best_head = cur_head;
+                bestsz = cursz;
+                break;
+            }
+        }
         cur_head = (size_t *)cur_head[2];
     }
+
+    cur_head = best_head;
+    cursz = bestsz;
 
     // no appropriate block found
     if (cur_head == NULL) {
